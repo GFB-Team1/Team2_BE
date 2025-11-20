@@ -3,6 +3,7 @@ from database import supabase
 from models import RoomCreate, RoomResponse, RoomInfo
 import secrets
 import string
+from datetime import datetime
 
 router = APIRouter(tags=["rooms"])
 
@@ -28,12 +29,39 @@ async def create_room(room: RoomCreate):
     Returns:
         - **room_slug**: 생성된 방의 고유 슬러그 (예: "kdef-39a1")
     """
-    # TODO: 여기서 구현하세요!
-    # 1. generate_room_slug()로 고유한 슬러그 생성
-    # 2. supabase.table("rooms").insert() 사용해서 DB에 저장
-    # 3. 생성된 room_slug 반환
+    room_slug = generate_room_slug()
     
-    pass
+    try:
+        result = (
+            supabase
+            .table("rooms")
+            .insert({
+                "room_slug": room_slug,
+                "title": room.title
+                # created_at은 DB에서 자동 생성
+            })
+            .execute()
+        )
+    
+        # 삽입 결과 확인
+        if not result.data :
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="방 생성에 실패했습니다."
+            )    
+    except HTTPException:
+        # 이미 발생한 HTTPException은 그대로 전파
+        raise
+
+    except Exception as e:
+        # 모든 예상치 못한 에러 처리
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"방 생성 중 오류가 발생했습니다: {str(e)}"
+        )    
+    
+    return RoomResponse(room_slug=room_slug)
+    
 
 
 @router.get("/room/{room_slug}", response_model=RoomInfo)
@@ -50,9 +78,42 @@ async def get_room(room_slug: str):
     Raises:
         - **404**: 방을 찾을 수 없음
     """
-    # TODO: 여기서 구현하세요!
-    # 1. supabase.table("rooms").select().eq("room_slug", room_slug) 사용
-    # 2. 방이 없으면 404 에러 발생
-    # 3. 방 정보(title, created_at) 반환
+    try:
+        result = (
+            supabase
+            .table("rooms")
+            .select("title, created_at")
+            .eq("room_slug", room_slug)
+            .execute()
+        )
     
-    pass
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"방 정보를 가져오는 중 오류가 발생했습니다: {str(e)}"
+        )
+        
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="방을 찾을 수 없습니다."
+        )
+    
+    room = result.data[0]
+    created_at_raw = room.get("created_at")
+
+    # created_at 파싱
+    try:
+        if isinstance(created_at_raw, str):
+            created_at = datetime.fromisoformat(
+                created_at_raw.replace("Z", "+00:00")
+            )
+        else:
+            created_at = datetime.utcnow()
+    except (ValueError, AttributeError):
+        created_at = datetime.utcnow()
+    
+    return RoomInfo(
+        title=room["title"],
+        created_at=created_at
+    )
