@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, status
 from database import supabase
-from models import RoomCreate, RoomResponse, RoomInfo
+from models import RoomCreate, RoomResponse, RoomInfo, ParticipantJoin, ParticipantResponse  # ← 2개 추가
+from utils.auth import hash_password, verify_password, create_access_token  # ← 새 줄 추가
 import secrets
 import string
 from datetime import datetime
@@ -116,4 +117,105 @@ async def get_room(room_slug: str):
     return RoomInfo(
         title=room["title"],
         created_at=created_at
+    )
+
+@router.post("/room/{room_slug}/join", response_model=ParticipantResponse)
+async def join_room(room_slug: str, participant: ParticipantJoin):
+    """
+    방에 참가하기 (신규 등록 또는 로그인)
+
+    password는 최소 4자리 이상
+    """
+
+    # 1. room_slug로 room_id 찾기
+    try:
+        room_result = (
+            supabase
+            .table("rooms")
+            .select("room_id")
+            .eq("room_slug", room_slug)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"방 정보를 조회하는 중 오류가 발생했습니다: {str(e)}"
+        )
+
+    if not room_result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="방을 찾을 수 없습니다."
+        )
+
+    room_id = room_result.data[0]["room_id"]
+
+    # 2. 기존 참가자 확인
+    try:
+        participant_result = (
+            supabase
+            .table("participants")
+            .select("participant_id, password_hash")
+            .eq("room_id", room_id)
+            .eq("nickname", participant.nickname)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"참가자 정보를 조회하는 중 오류가 발생했습니다: {str(e)}"
+        )
+
+    # 3-A. 기존 참가자 (로그인)
+    if participant_result.data:
+        existing = participant_result.data[0]
+
+        if not verify_password(participant.password, existing["password_hash"]):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="비밀번호가 일치하지 않습니다."
+            )
+
+        participant_id = existing["participant_id"]
+
+    # 3-B. 신규 참가자 (회원가입)
+    else:
+        hashed_password = hash_password(participant.password)
+
+        try:
+            insert_result = (
+                supabase
+                .table("participants")
+                .insert({
+                    "room_id": room_id,
+                    "nickname": participant.nickname,
+                    "password_hash": hashed_password
+                })
+                .execute()
+            )
+
+            if not insert_result.data or len(insert_result.data) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="참가자 등록에 실패했습니다."
+                )
+
+            participant_id = insert_result.data[0]["participant_id"]
+
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"참가자 등록 중 오류가 발생했습니다: {str(e)}"
+            )
+
+    # 4. JWT 토큰 생성
+    token = create_access_token({
+        "room_id": room_id,
+        "participant_id": participant_id,
+        "nickname": participant.nickname
+    })
+
+    return ParticipantResponse(
+        token=token,
+        nickname=participant.nickname
     )

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     supabase_service_key: str
     jwt_secret: str
     jwt_algorithm: str = "HS256"
-    jwt_expiration_hours: int = 24
+    jwt_expiration_hours: int = 168
     
     class Config:
         env_file = ".env"
