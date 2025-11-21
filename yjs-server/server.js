@@ -4,6 +4,9 @@ const http = require('http')
 const { createClient } = require('@supabase/supabase-js')
 const jwt = require('jsonwebtoken')
 
+// 포트 설정 (맨 위로 이동)
+const PORT = process.env.PORT || 1234
+
 // Supabase 클라이언트 생성
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -67,6 +70,7 @@ async function loadDocumentFromDB(roomSlug) {
 }
 
 // DB에 문서 저장
+// DB에 문서 저장
 async function saveDocumentToDB(roomSlug) {
     try {
         const room = rooms.get(roomSlug)
@@ -76,8 +80,9 @@ async function saveDocumentToDB(roomSlug) {
         }
 
         // 모든 업데이트를 하나로 합치기
-        const totalLength = room.updates.reduce((sum, update) => sum + update.length, 0)
+        const totalLength = room.updates.reduce((sum, buf) => sum + buf.length, 0)
         const merged = Buffer.concat(room.updates, totalLength)
+        const encoded = merged.toString('base64')
 
         // room_slug로 room_id 찾기
         const { data: roomData, error: roomError } = await supabase
@@ -91,9 +96,6 @@ async function saveDocumentToDB(roomSlug) {
             return
         }
 
-        // base64 인코딩
-        const encoded = merged.toString('base64')
-
         // upsert (있으면 업데이트, 없으면 생성)
         const { error: upsertError } = await supabase
             .from('documents')
@@ -105,7 +107,7 @@ async function saveDocumentToDB(roomSlug) {
         if (upsertError) {
             console.error(`[${roomSlug}] DB 저장 실패:`, upsertError)
         } else {
-            console.log(`[${roomSlug}] DB 저장 완료 (${merged.length} bytes)`)
+            console.log(`[${roomSlug}] ✅ DB 저장 완료 (${totalLength} bytes)`)
         }
 
     } catch (error) {
@@ -128,9 +130,21 @@ wss.on('connection', async (ws, req) => {
         return
     }
 
+    // 디버깅: 토큰 전체 출력
+    console.log(`[${roomSlug}] 받은 토큰 전체:`, token)
+    console.log(`[${roomSlug}] JWT_SECRET:`, JWT_SECRET ? 'exists' : 'missing')
+
+    // 🔥 y-websocket이 URL 끝에 /를 추가하는 문제 해결
+    // 토큰 끝에 /나 /room-slug 같은 게 붙어있으면 제거
+    let cleanToken = token
+    if (token.includes('/')) {
+        cleanToken = token.split('/')[0]
+        console.log(`[${roomSlug}] 토큰 정리 완료:`, cleanToken.substring(0, 50))
+    }
+
     let tokenData
     try {
-        tokenData = jwt.verify(token, JWT_SECRET)
+        tokenData = jwt.verify(cleanToken, JWT_SECRET)
         console.log(`[${roomSlug}] ✅ 인증 성공: ${tokenData.nickname} (participant_id: ${tokenData.participant_id})`)
     } catch (error) {
         console.log(`[${roomSlug}] ❌ 토큰 검증 실패: ${error.message}`)
@@ -138,25 +152,10 @@ wss.on('connection', async (ws, req) => {
         return
     }
 
-    // 2️⃣ room_id 확인
-    if (tokenData.room_id) {
-        // 토큰의 room_id와 실제 방이 일치하는지 확인 (선택사항)
-        const { data: roomData } = await supabase
-            .from('rooms')
-            .select('room_id')
-            .eq('room_slug', roomSlug)
-            .single()
-
-        if (roomData && roomData.room_id !== tokenData.room_id) {
-            console.log(`[${roomSlug}] ❌ 권한 없음 - 다른 방의 토큰`)
-            ws.close(1008, '이 방에 접근할 권한이 없습니다')
-            return
-        }
-    }
-
-    // 3️⃣ 방 생성 및 문서 로드
-    // 방이 없으면 생성 및 DB에서 문서 로드
+    // 방 생성 및 문서 로드
     if (!rooms.has(roomSlug)) {
+        console.log(`[${roomSlug}] 새 방 생성 중...`)
+        
         rooms.set(roomSlug, {
             clients: new Set(),
             updates: []
@@ -165,20 +164,23 @@ wss.on('connection', async (ws, req) => {
         // DB에서 문서 불러오기
         const savedDoc = await loadDocumentFromDB(roomSlug)
         if (savedDoc) {
+            // ✅ DB에서 불러온 문서를 updates 배열에 추가
             rooms.get(roomSlug).updates.push(savedDoc)
-            // 첫 접속자에게 문서 전송
-            ws.send(savedDoc)
+            console.log(`[${roomSlug}] DB 문서를 메모리에 로드 완료`)
         }
-    } else {
-        // 기존 방에 접속: 현재까지의 모든 업데이트 전송
-        const room = rooms.get(roomSlug)
+    }
+
+    // 방 입장 - 현재까지의 모든 업데이트를 새 접속자에게 전송
+    const room = rooms.get(roomSlug)
+    if (room.updates.length > 0) {
+        console.log(`[${roomSlug}] 기존 문서 전송: ${room.updates.length}개 업데이트`)
         room.updates.forEach(update => {
             ws.send(update)
         })
+    } else {
+        console.log(`[${roomSlug}] 빈 문서로 시작`)
     }
 
-    // 클라이언트 추가
-    const room = rooms.get(roomSlug)
     room.clients.add(ws)
     console.log(`[${roomSlug}] 참가자 입장: ${tokenData.nickname} (현재 인원: ${room.clients.size}명)`)
 
@@ -222,8 +224,6 @@ wss.on('connection', async (ws, req) => {
         console.error(`[${roomSlug}] 웹소켓 에러:`, error)
     })
 })
-
-const PORT = process.env.PORT || 1234
 
 server.listen(PORT, () => {
     console.log(`🚀 Y.js WebSocket Server running on ws://localhost:${PORT}`)

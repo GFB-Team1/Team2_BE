@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import rooms, websocket
+from routers import rooms
+# websocket 프록시 제거 - 클라이언트가 Node.js에 직접 연결
 
 app = FastAPI(
     title="Meeting Scheduler API",
@@ -19,7 +20,7 @@ app.add_middleware(
 
 # 라우터 등록
 app.include_router(rooms.router)
-app.include_router(websocket.router)
+# app.include_router(websocket.router)  # 프록시 제거
 
 
 @app.get("/")
