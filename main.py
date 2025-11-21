@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import rooms
+from routers import rooms, websocket
 
 app = FastAPI(
     title="Meeting Scheduler API",
@@ -19,6 +19,7 @@ app.add_middleware(
 
 # 라우터 등록
 app.include_router(rooms.router)
+app.include_router(websocket.router)
 
 
 @app.get("/")
