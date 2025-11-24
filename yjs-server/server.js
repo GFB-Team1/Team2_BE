@@ -3,8 +3,9 @@ const WebSocket = require('ws')
 const http = require('http')
 const { createClient } = require('@supabase/supabase-js')
 const jwt = require('jsonwebtoken')
+const Y = require('yjs')
 
-// 포트 설정 (맨 위로 이동)
+// 포트 설정
 const PORT = process.env.PORT || 1234
 
 // Supabase 클라이언트 생성
@@ -20,9 +21,9 @@ if (!JWT_SECRET) {
     process.exit(1)
 }
 
-// 방별 문서 저장소
+// 방별 Y.Doc 저장소
 const rooms = new Map()
-// 구조: { "room_slug": { clients: Set(), updates: [] } }
+// 구조: { "room_slug": { ydoc: Y.Doc, clients: Set() } }
 
 const server = http.createServer((request, response) => {
     response.writeHead(200, { 'Content-Type': 'text/plain' })
@@ -30,6 +31,30 @@ const server = http.createServer((request, response) => {
 })
 
 const wss = new WebSocket.Server({ server })
+
+// ✅ getYDoc 훅: Y.Doc 생성 시 XmlFragment("prosemirror") 초기화
+function getYDoc(roomSlug) {
+    if (rooms.has(roomSlug)) {
+        return rooms.get(roomSlug).ydoc
+    }
+
+    console.log(`[${roomSlug}] 새 Y.Doc 생성 중 (XmlFragment 기반)...`)
+    
+    const ydoc = new Y.Doc()
+    
+    // 🔥 Tiptap Collaboration이 사용하는 key는 "prosemirror"
+    const fragment = ydoc.getXmlFragment('prosemirror')
+    
+    console.log(`[${roomSlug}] ✅ XmlFragment("prosemirror") 생성 완료`)
+    
+    // 방 정보 저장
+    rooms.set(roomSlug, {
+        ydoc: ydoc,
+        clients: new Set()
+    })
+
+    return ydoc
+}
 
 // DB에서 문서 불러오기
 async function loadDocumentFromDB(roomSlug) {
@@ -61,7 +86,7 @@ async function loadDocumentFromDB(roomSlug) {
         // base64 디코딩
         const buffer = Buffer.from(docData.doc_state, 'base64')
         console.log(`[${roomSlug}] DB에서 문서 로드 완료 (${buffer.length} bytes)`)
-        return buffer
+        return new Uint8Array(buffer)
 
     } catch (error) {
         console.error(`[${roomSlug}] DB 로드 실패:`, error)
@@ -70,19 +95,17 @@ async function loadDocumentFromDB(roomSlug) {
 }
 
 // DB에 문서 저장
-// DB에 문서 저장
 async function saveDocumentToDB(roomSlug) {
     try {
         const room = rooms.get(roomSlug)
-        if (!room || room.updates.length === 0) {
-            console.log(`[${roomSlug}] 저장할 업데이트 없음`)
+        if (!room || !room.ydoc) {
+            console.log(`[${roomSlug}] 저장할 문서 없음`)
             return
         }
 
-        // 모든 업데이트를 하나로 합치기
-        const totalLength = room.updates.reduce((sum, buf) => sum + buf.length, 0)
-        const merged = Buffer.concat(room.updates, totalLength)
-        const encoded = merged.toString('base64')
+        // Y.Doc 전체 상태를 StateVector로 인코딩
+        const stateVector = Y.encodeStateAsUpdate(room.ydoc)
+        const encoded = Buffer.from(stateVector).toString('base64')
 
         // room_slug로 room_id 찾기
         const { data: roomData, error: roomError } = await supabase
@@ -107,7 +130,7 @@ async function saveDocumentToDB(roomSlug) {
         if (upsertError) {
             console.error(`[${roomSlug}] DB 저장 실패:`, upsertError)
         } else {
-            console.log(`[${roomSlug}] ✅ DB 저장 완료 (${totalLength} bytes)`)
+            console.log(`[${roomSlug}] ✅ DB 저장 완료 (${stateVector.length} bytes)`)
         }
 
     } catch (error) {
@@ -152,55 +175,55 @@ wss.on('connection', async (ws, req) => {
         return
     }
 
-    // 방 생성 및 문서 로드
-    if (!rooms.has(roomSlug)) {
-        console.log(`[${roomSlug}] 새 방 생성 중...`)
-        
-        rooms.set(roomSlug, {
-            clients: new Set(),
-            updates: []
-        })
+    // 2️⃣ Y.Doc 가져오기 또는 생성 (getYDoc 훅 사용)
+    const ydoc = getYDoc(roomSlug)
+    const room = rooms.get(roomSlug)
 
-        // DB에서 문서 불러오기
-        const savedDoc = await loadDocumentFromDB(roomSlug)
-        if (savedDoc) {
-            // ✅ DB에서 불러온 문서를 updates 배열에 추가
-            rooms.get(roomSlug).updates.push(savedDoc)
-            console.log(`[${roomSlug}] DB 문서를 메모리에 로드 완료`)
+    // 3️⃣ DB에서 문서 로드 (처음 접속 시에만)
+    if (room.clients.size === 0) {
+        console.log(`[${roomSlug}] 첫 접속자 - DB에서 문서 로드 시도`)
+        const savedState = await loadDocumentFromDB(roomSlug)
+        
+        if (savedState) {
+            // DB에서 불러온 상태를 Y.Doc에 적용
+            Y.applyUpdate(ydoc, savedState)
+            console.log(`[${roomSlug}] ✅ DB 문서를 Y.Doc에 복원 완료`)
+        } else {
+            console.log(`[${roomSlug}] 새 빈 문서로 시작`)
         }
     }
 
-    // 방 입장 - 현재까지의 모든 업데이트를 새 접속자에게 전송
-    const room = rooms.get(roomSlug)
-    if (room.updates.length > 0) {
-        console.log(`[${roomSlug}] 기존 문서 전송: ${room.updates.length}개 업데이트`)
-        room.updates.forEach(update => {
-            ws.send(update)
-        })
-    } else {
-        console.log(`[${roomSlug}] 빈 문서로 시작`)
-    }
+    // 4️⃣ 현재 문서 상태를 새 클라이언트에게 전송
+    const currentState = Y.encodeStateAsUpdate(ydoc)
+    ws.send(currentState)
+    console.log(`[${roomSlug}] 현재 문서 상태 전송 (${currentState.length} bytes)`)
 
+    // 5️⃣ 클라이언트 추가
     room.clients.add(ws)
     console.log(`[${roomSlug}] 참가자 입장: ${tokenData.nickname} (현재 인원: ${room.clients.size}명)`)
 
-    // 메시지 수신: 같은 방의 다른 모든 클라이언트에게 브로드캐스트
+    // 6️⃣ 메시지 수신 핸들러
     ws.on('message', (message) => {
         const room = rooms.get(roomSlug)
         if (!room) return
 
-        // 업데이트 저장 (메모리에 누적)
-        room.updates.push(Buffer.from(message))
+        try {
+            // Y.js update를 Y.Doc에 적용
+            const update = new Uint8Array(message)
+            Y.applyUpdate(room.ydoc, update)
 
-        // 다른 클라이언트에게 브로드캐스트
-        room.clients.forEach((client) => {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-                client.send(message)
-            }
-        })
+            // 다른 클라이언트에게 브로드캐스트
+            room.clients.forEach((client) => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(message)
+                }
+            })
+        } catch (error) {
+            console.error(`[${roomSlug}] 메시지 처리 오류:`, error)
+        }
     })
 
-    // 연결 종료
+    // 7️⃣ 연결 종료 핸들러
     ws.on('close', async () => {
         console.log(`[${roomSlug}] 클라이언트 연결 종료: ${tokenData.nickname}`)
 
@@ -227,4 +250,6 @@ wss.on('connection', async (ws, req) => {
 
 server.listen(PORT, () => {
     console.log(`🚀 Y.js WebSocket Server running on ws://localhost:${PORT}`)
+    console.log(`📝 Document type: XmlFragment("prosemirror")`)
+    console.log(`🔗 Tiptap Collaboration 호환 모드`)
 })
