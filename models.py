@@ -42,3 +42,16 @@ class TokenData(BaseModel):
     room_id: int
     participant_id: int
     nickname: str
+
+
+# === 문서 내용 관련 모델 ===
+
+class ContentSave(BaseModel):
+    """문서 내용 저장 요청 모델"""
+    content: str = Field(..., description="저장할 문서 내용 (JSON 문자열 또는 Base64)")
+
+
+class ContentResponse(BaseModel):
+    """문서 내용 응답 모델"""
+    content: Optional[str] = Field(None, description="저장된 문서 내용")
+    updated_at: Optional[datetime] = Field(None, description="마지막 업데이트 시각")
